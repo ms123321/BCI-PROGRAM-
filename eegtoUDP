@@ -1,0 +1,109 @@
+#https://openbci.com/downloads 
+#use openbci gui- from openbci(the orginization)
+#go to networking tab after starting the main stream
+# go to udp - turn on rawunfiltered timeseries - stream it -
+#open dash in browser http://127.0.0.1:8050/
+
+
+import socket
+import json
+from dash import dcc, html, Dash
+from dash.dependencies import Input, Output
+import pandas as pd
+import plotly.graph_objs as go
+import threading
+
+# Initialize a Dash app
+app = Dash(__name__)
+
+# Set up the layout of the Dash app
+app.layout = html.Div(children=[
+    html.Div(id='live-update-container'),  # Container for displaying live updates
+    dcc.Interval(
+        id='interval-component',
+        interval=1 * 1000,  # Update interval in milliseconds
+        n_intervals=0
+    )
+])
+
+# Define a RingBuffer class for managing and updating data
+class RingBuffer:
+    def __init__(self, size):
+        self.size = size
+        # Create separate DataFrames for each of the eight columns
+        self.dataframes = {f'column_{i}': pd.DataFrame({'x': []}) for i in range(1, 9)}
+
+    def append(self, data):
+        data_type = data.get("type", "")
+        data_values = data.get("data", [])
+
+        # Check if received data is of type "timeSeriesRaw" and has the expected structure
+        if data_type == "timeSeriesRaw" and data_values and len(data_values) == 8:
+            x_values = self.dataframes['column_1']['x'].iloc[-1] + 1 if not self.dataframes['column_1'].empty else 0
+
+            # Iterate through columns and update corresponding DataFrames
+            for i, col_name in enumerate(self.dataframes.keys(), start=1):
+                df = self.dataframes[col_name]
+
+                # Check if the data_values list has enough elements
+                if len(data_values[i - 1]) > 0:
+                    value = data_values[i - 1][0]
+                    df_dict = {'x': [x_values], 'y': [value]}
+                    df = pd.concat([df, pd.DataFrame(df_dict)])
+                    df = df.tail(self.size)
+
+                    self.dataframes[col_name] = df
+
+# Create an instance of the RingBuffer class with a buffer size of 100
+ring_buffer = RingBuffer(100)
+
+# Define a color scale for the plots
+color_scale = ['#808080', '#800080', '#0000FF', '#008000', '#FFFF00', '#FFA500', '#FF0000', '#A52A2A']
+
+# Define a callback to update the container with separate graphs
+@app.callback(
+    Output('live-update-container', 'children'),
+    Input('interval-component', 'n_intervals')
+)
+def update_container(n):
+    graphs = []
+
+    # Iterate through columns and create/update corresponding graphs
+    for i, (col_name, df) in enumerate(ring_buffer.dataframes.items()):
+        trace = go.Scatter(
+            x=df['x'], y=df['y'],
+            mode='lines+markers', name=f'Channel {i + 1}',  # Adjusted label to "Channel"
+            line=dict(color=color_scale[i]),
+            marker=dict(color=color_scale[i])
+        )
+        graph = dcc.Graph(figure={'data': [trace]}, id=f'graph-{col_name}')
+        graphs.append(html.Div(graph))
+
+    return graphs
+
+# Create a UDP socket for receiving data
+host = "127.0.0.1"
+port = 12346
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((host, port))
+
+# Receive and append data in a separate thread
+def receive_data():
+    try:
+        while True:
+            data, addr = sock.recvfrom(1024)
+            print("Received data:", data.decode("utf-8"))
+            ring_buffer.append(json.loads(data.decode("utf-8")))
+    except KeyboardInterrupt:
+        print("Exiting program.")
+    finally:
+        sock.close()
+
+# Start receiving data in a separate thread
+data_thread = threading.Thread(target=receive_data)
+data_thread.start()
+
+# Start the Dash app
+if __name__ == '__main__':
+    app.run_server(debug=True, use_reloader=False)
